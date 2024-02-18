@@ -1,3 +1,8 @@
+.history
+lightning_logs
+tensorboard
+
+
 # Byte-compiled / optimized / DLL files
 __pycache__/
 *.py[cod]
