@@ -15,8 +15,11 @@ import plotly.express as px
 import plotly.graph_objects as go
 
 from non_parametric_ml.pytorch_tools.losses import PinballLoss
-
+from torch.utils.data import random_split
 import plotly.io as pio
+from non_parametric_ml.utils import set_all_random_seeds
+
+set_all_random_seeds()
 
 # Set the default template for plotly
 pio.templates.default = 'plotly_white'
@@ -31,6 +34,9 @@ def create_data(multimodal: bool):
     return torch.tensor(X[..., None]).float(), torch.tensor(y[..., None]).float()
 
 class BinarizedQuantileLoss(nn.Module):
+
+    needs_logits: bool = True
+
     def __init__(self, quantiles):
         super(BinarizedQuantileLoss, self).__init__()
         self.register_buffer('quantiles', torch.tensor(quantiles, dtype=torch.float))
@@ -48,9 +54,8 @@ class BinarizedQuantileLoss(nn.Module):
     def forward(self, q_hat, y_true, logits):
         q_low = q_hat[:, 0:1]
         q_high = q_hat[:, -1:]
-        q_interm = logits  # Use logits directly for cross-entropy
 
-        bin_labels = self.find_bin_indices(y_true, q_low, q_high, q_interm.size(1)).squeeze()
+        bin_labels = self.find_bin_indices(y_true, q_low, q_high, logits.size(1)).squeeze()
         ce_loss = F.cross_entropy(logits, bin_labels)
         q_loss = self.qloss_low(q_low, y_true) + self.qloss_high(q_high, y_true)
 
@@ -64,33 +69,10 @@ class NonCrossQuantReg(pl.LightningModule):
 
         self.din = din
         self.loss_fn = loss_fn if loss_fn is not None else PinballLoss(quantiles)
-        # self.scores_fc = nn.Linear(din, len(quantiles) - 1)
-        # self.width_fc = nn.Linear(din, 1)
-        # self.min_fc = nn.Linear(din, 1)
-
-        self.scores_fc = nn.Sequential(
-            nn.Linear(din, 128),
-            nn.ReLU(),
-            nn.Linear(128, 64),
-            nn.ReLU(),
-            nn.Linear(64, len(quantiles) - 1)
-        )
-
-        self.width_fc = nn.Sequential(
-            nn.Linear(din, 128),
-            nn.ReLU(),
-            nn.Linear(128, 64),
-            nn.ReLU(),
-            nn.Linear(64, 1)
-        )
-
-        self.min_fc = nn.Sequential(
-            nn.Linear(din, 128),
-            nn.ReLU(),
-            nn.Linear(128, 64),
-            nn.ReLU(),
-            nn.Linear(64, 1)
-        )
+        self.val_loss_fn = PinballLoss(quantiles)
+        self.scores_fc = nn.Linear(din, len(quantiles) - 1)
+        self.width_fc = nn.Linear(din, 1)
+        self.min_fc = nn.Linear(din, 1)
 
         self.model_name = name if name is not None else self.__class__.__name__
 
@@ -112,25 +94,78 @@ class NonCrossQuantReg(pl.LightningModule):
         X, y = batch
         q_hat, logits = self.forward(X)
         probs = F.softmax(logits, dim=1)
-        loss = self.loss_fn(q_hat, y, logits)
+        if self.loss_fn.needs_logits:
+            loss = self.loss_fn(q_hat, y, logits)
+        else:
+            loss = self.loss_fn(q_hat, y)
+
         self.log("train_loss", loss)
+        return loss
+    
+    def validation_step(self, batch, batch_idx):
+        X, y = batch
+        q_hat, logits = self.forward(X)
+        loss = self.val_loss_fn(pred=q_hat, target=y)
+        self.log("val_loss", loss)
         return loss
 
     def configure_optimizers(self):
-        return Adam(self.parameters(), lr=1e-4)
+        # optimizer = torch.optim.LBFGS(self.parameters(), lr = 1, max_iter=50)
+        optimizer = Adam(self.parameters(), lr=1e-4)
+        return optimizer
+        
 
 
 # Data preparation
 multimodal = False
 X, y = create_data(multimodal)
+
+dataset = TensorDataset(X, y)
+train_dataset, val_dataset = random_split(dataset, [0.8, 0.2])
+
+train_loader = DataLoader(train_dataset, batch_size=64, shuffle=True)
+val_loader = DataLoader(val_dataset, batch_size=len(val_dataset), shuffle=False) 
+
 dataloader = DataLoader(TensorDataset(X, y), batch_size=64, shuffle=True)
 
-# Model instantiation and training
-quantiles = np.linspace(0.01, 0.99, 10)
-model = NonCrossQuantReg(din=1, quantiles=quantiles, loss_fn=BinarizedQuantileLoss(quantiles))
-trainer = pl.Trainer(max_epochs=500)
-trainer.fit(model, dataloader)
+early_stop_callback = pl.callbacks.EarlyStopping(
+        monitor='val_loss',  # Metric to monitor
+        patience=200,  # Number of epochs with no improvement after which training will be stopped
+        verbose=False,
+        mode='min'  # Stops training when the quantity monitored has stopped decreasing
+        )
 
+# Define ModelCheckpoint callback
+checkpoint_callback = pl.callbacks.ModelCheckpoint(
+    monitor='val_loss',  # Monitor validation loss
+    save_top_k=1,
+    mode='min',
+    dirpath='lightning_checkpoints/',
+    filename='best-checkpoint-lbfgs'
+)
+
+# logger = TensorBoardLogger("tensorboard", name=model.model_name)
+
+# trainer = pl.Trainer(callbacks=[early_stop_callback], max_epochs=300, logger = logger)
+
+# Model instantiation and training
+din=1
+quantiles = np.linspace(0.05, 0.95, 100)
+device = torch.device("mps" if torch.backends.mps.is_available() else "cpu")
+# model = NonCrossQuantReg(din=1, quantiles=quantiles, loss_fn=PinballLoss(quantiles))
+
+model = NonCrossQuantReg(din=din, quantiles=quantiles, loss_fn=BinarizedQuantileLoss(quantiles))
+trainer = pl.Trainer(max_epochs=2000, callbacks=[early_stop_callback, checkpoint_callback])
+trainer.fit(model, train_loader, val_loader)
+
+# model_best = NonCrossQuantReg.load_from_checkpoint(
+#     din=din,
+#     quantiles=quantiles,
+#     loss_fn=BinarizedQuantileLoss(quantiles),
+#     checkpoint_path="lightning_checkpoints/best-checkpoint-lbfgs.ckpt").to('cpu')
+
+
+# model = model_best
 
 
 model.eval()
@@ -144,11 +179,11 @@ with torch.no_grad():
     logits = logits.numpy()
 
 
-probs_df = pd.DataFrame(probs, columns = quantiles[1:].round(2))
+probs_df = pd.DataFrame(probs, columns = quantiles[1:].round(3))
 max_quantile_indices = probs_df.idxmax(axis=1)
 
 
-qnames = [f'q{q:.2f}' for q in quantiles]
+qnames = [f'q{q:.3f}' for q in quantiles]
 
 y_hat_df = (pd.DataFrame(q_hat, columns = qnames)
             .assign(
@@ -160,8 +195,13 @@ y_hat_df = (pd.DataFrame(q_hat, columns = qnames)
 
 y_hat_df
 
-# Assuming y_hat_df is your DataFrame and it contains columns 'X', 'q0.50', 'q0.95'
+assert all(name in y_hat_df.columns for name in qnames), "Some quantiles in qnames do not exist in y_hat_df"
+assert not y_hat_df.empty, "y_hat_df is empty"
 fig = px.line(y_hat_df, x='X', y=qnames, title="MQR qloss(low, high) + xentropy loss")
+
+
+# Assuming y_hat_df is your DataFrame and it contains columns 'X', 'q0.50', 'q0.95'
+fig = px.line(y_hat_df, x='X', y=['q0.050', 'q0.105', 'q0.505', 'q0.705', 'q0.950'], title="MQR qloss(low, high) + xentropy loss")
 fig.add_trace(go.Scatter(x=y_hat_df['X'], y=y_hat_df['y'], mode='markers', name='True values'))
 fig.show()
 
